@@ -1,0 +1,27 @@
+# ============================================================
+# PR Review Agent — Dependencies
+# ============================================================
+
+# Anthropic SDK — the official Python library for the Claude API.
+# This gives us: client.messages.create(), typed models, streaming, etc.
+anthropic>=0.50.0
+
+# FastAPI — modern, fast web framework for building the webhook server.
+# FastAPI uses Python type hints to auto-generate validation and docs.
+fastapi>=0.115.0
+
+# Uvicorn — ASGI server that runs FastAPI in production.
+# ASGI (Asynchronous Server Gateway Interface) handles async Python web apps.
+uvicorn[standard]>=0.32.0
+
+# Requests — HTTP library for calling the GitHub REST API.
+# Simple, synchronous HTTP calls. Perfect for API interactions.
+requests>=2.32.0
+
+# python-dotenv — loads .env files into environment variables.
+# Keeps secrets out of source code.
+python-dotenv>=1.0.0
+
+# Rich — beautiful terminal output with colors, tables, and progress bars.
+# Makes CLI usage much more readable.
+rich>=13.9.0
