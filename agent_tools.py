@@ -50,6 +50,12 @@ TIPS FOR GOOD TOOL DESCRIPTIONS:
 
 from github_client import github
 
+# Per-result size caps — keeps individual tool outputs from flooding the context.
+# Claude works well with ~1K tokens per file diff; full diffs are available via get_file_content.
+_MAX_PATCH_CHARS_PER_FILE = 4_000   # ~1K tokens: enough for most diffs, truncate the rest
+_MAX_FILES_RESULT_CHARS  = 40_000   # ~10K tokens: total cap for get_pr_files output
+_MAX_FILE_CONTENT_CHARS  = 20_000   # ~5K tokens: cap for get_file_content output
+
 
 # ================================================================
 # TOOL DEFINITIONS (JSON Schema — what Claude sees)
@@ -283,7 +289,16 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             # Add line numbers to the content for easier reference
             lines = result.split("\n")
             numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
-            return f"File: {tool_input['path']} (at ref {tool_input['ref']})\n\n{numbered}"
+            header = f"File: {tool_input['path']} (at ref {tool_input['ref']})\n\n"
+            full = header + numbered
+            if len(full) > _MAX_FILE_CONTENT_CHARS:
+                full = (
+                    full[:_MAX_FILE_CONTENT_CHARS]
+                    + f"\n\n[TRUNCATED: showing first {_MAX_FILE_CONTENT_CHARS} chars"
+                    + f" of {len(full)} total ({len(lines)} lines). Request a smaller"
+                    + " ref range or a specific section if you need more.]"
+                )
+            return full
 
         elif tool_name == "get_pr_commits":
             result = github.get_pr_commits(
@@ -353,7 +368,24 @@ def _format_pr_files(files: list) -> str:
         return "No files changed in this PR."
 
     parts = []
-    for f in files:
+    total_chars = 0
+
+    for idx, f in enumerate(files):
+        # If we've already emitted a lot of content, switch to stats-only for the rest
+        if total_chars > _MAX_FILES_RESULT_CHARS:
+            remaining = files[idx:]
+            summary = [
+                f"\n[{len(remaining)} more file(s) not shown — size limit reached."
+                " Showing stats only. Use get_file_content to inspect these:]"
+            ]
+            for rem in remaining:
+                summary.append(
+                    f"  • {rem['filename']} ({rem['status']},"
+                    f" +{rem['additions']} -{rem['deletions']})"
+                )
+            parts.append("\n".join(summary))
+            break
+
         status_emoji = {
             "added": "✅ ADDED",
             "removed": "❌ DELETED",
@@ -372,7 +404,18 @@ def _format_pr_files(files: list) -> str:
             header += f"Renamed from: {f['previous_filename']}\n"
 
         patch = f.get("patch", "(No diff available)")
-        parts.append(f"{header}\nDiff:\n{patch}")
+
+        # Truncate individual file diffs that are too large
+        if len(patch) > _MAX_PATCH_CHARS_PER_FILE:
+            patch = (
+                patch[:_MAX_PATCH_CHARS_PER_FILE]
+                + f"\n... [diff truncated — {len(patch) - _MAX_PATCH_CHARS_PER_FILE} more chars."
+                + " Call get_file_content for the full file.]"
+            )
+
+        file_section = f"{header}\nDiff:\n{patch}"
+        parts.append(file_section)
+        total_chars += len(file_section)
 
     return "\n\n".join(parts)
 

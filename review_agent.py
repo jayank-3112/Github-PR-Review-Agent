@@ -61,6 +61,87 @@ from agent_tools import TOOLS, execute_tool
 # It reads ANTHROPIC_API_KEY from the environment automatically.
 client = anthropic.Anthropic(api_key=config.anthropic_api_key)
 
+# Trim the messages list when it exceeds this many characters (~100K tokens).
+# Leaves headroom for the system prompt, tool schemas, output, and thinking blocks
+# within Claude's 200K context window.
+_CONTEXT_TRIM_CHARS = 400_000
+_KEEP_RECENT_PAIRS  = 3   # Always keep the last N tool-call/result pairs intact
+
+
+def _estimate_messages_chars(messages: list) -> int:
+    """Rough character count across all messages — used to decide when to trim."""
+    total = 0
+    for msg in messages:
+        content = msg["content"]
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total += len(str(block.get("content", "")))
+                    total += len(str(block.get("text", "")))
+                else:
+                    # SDK content block (ThinkingBlock, ToolUseBlock, TextBlock)
+                    total += len(repr(block))
+    return total
+
+
+def _trim_context(messages: list) -> list:
+    """
+    Reduce context size by replacing old tool results with short placeholders.
+
+    Keeps the message *structure* intact (Claude still sees that it called
+    get_pr_details, etc.) but replaces the bulky result data for older turns.
+    The last _KEEP_RECENT_PAIRS assistant+user pairs are always kept in full.
+    messages[0] (the original task) is never touched.
+    """
+    # Walk the list and collect (assistant_idx, user_idx) pairs.
+    # Structure: [user(task)] [assistant][user] [assistant][user] ...
+    pair_indices = []
+    i = 1
+    while i < len(messages) - 1:
+        if messages[i]["role"] == "assistant" and messages[i + 1]["role"] == "user":
+            pair_indices.append((i, i + 1))
+            i += 2
+        else:
+            i += 1
+
+    if len(pair_indices) <= _KEEP_RECENT_PAIRS:
+        return messages  # Nothing old enough to trim yet
+
+    # Identify which user (tool_result) messages to slim down
+    pairs_to_slim = pair_indices[:-_KEEP_RECENT_PAIRS]
+    slim_indices = {user_idx for _, user_idx in pairs_to_slim}
+
+    trimmed = []
+    for i, msg in enumerate(messages):
+        if i not in slim_indices:
+            trimmed.append(msg)
+            continue
+
+        # Slim this tool_result message: keep the structure, gut the content
+        content = msg["content"]
+        if not isinstance(content, list):
+            trimmed.append(msg)
+            continue
+
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                new_content.append({
+                    "type": "tool_result",
+                    "tool_use_id": block["tool_use_id"],
+                    "content": (
+                        "[Result evicted from context window to stay within size limits."
+                        " This tool was already called and its data was processed.]"
+                    ),
+                })
+            else:
+                new_content.append(block)
+        trimmed.append({**msg, "content": new_content})
+
+    return trimmed
+
 # ================================================================
 # SYSTEM PROMPT
 # ================================================================
@@ -208,6 +289,15 @@ def review_pr(owner: str, repo: str, pr_number: int) -> dict:
     while iteration < max_iterations:
         iteration += 1
         print(f"\n⚡ Agent iteration {iteration}/{max_iterations}")
+
+        # ── Trim context if it's growing too large ───────────────
+        # Evicts old tool-result bodies while keeping the message structure,
+        # so Claude still knows what it called but isn't re-reading old data.
+        context_chars = _estimate_messages_chars(messages)
+        if context_chars > _CONTEXT_TRIM_CHARS:
+            messages = _trim_context(messages)
+            new_chars = _estimate_messages_chars(messages)
+            print(f"✂️  Context trimmed: {context_chars:,} → {new_chars:,} chars")
 
         # ── Call Claude ──────────────────────────────────────────
         # Key parameters:
