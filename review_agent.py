@@ -1,81 +1,10 @@
-"""
-review_agent.py — The Core Claude PR Review Agent
-===================================================
-WHAT THIS FILE DOES:
-    This is the heart of the project. It implements the "agentic loop" —
-    the pattern where Claude repeatedly reasons, calls tools, reads results,
-    and repeats until it has completed the task.
-
-THE AGENTIC LOOP EXPLAINED:
-    ┌─────────────────────────────────────────────────────────┐
-    │                                                          │
-    │   Messages:                                              │
-    │   [system prompt] + [user: "Review PR #123"]            │
-    │              │                                           │
-    │              ▼                                           │
-    │   Claude thinks → calls get_pr_details                  │
-    │   stop_reason = "tool_use"                              │
-    │              │                                           │
-    │   We execute the tool, get the result                   │
-    │              │                                           │
-    │   Messages:  + [assistant: tool_use block]              │
-    │              + [user: tool_result block]                 │
-    │              │                                           │
-    │              ▼                                           │
-    │   Claude thinks → calls get_pr_files                    │
-    │   stop_reason = "tool_use"                              │
-    │              │                                           │
-    │   ... (repeat for each tool call)                       │
-    │              │                                           │
-    │              ▼                                           │
-    │   Claude calls submit_review                            │
-    │   stop_reason = "tool_use"                              │
-    │              │                                           │
-    │   We execute submit_review (posts to GitHub)            │
-    │              │                                           │
-    │              ▼                                           │
-    │   Claude sends final message                            │
-    │   stop_reason = "end_turn" ← We exit the loop           │
-    │                                                          │
-    └─────────────────────────────────────────────────────────┘
-
-PROMPT CACHING:
-    The system prompt is large and the same for every review.
-    By adding cache_control to it, the first request pays 1.25x,
-    all subsequent requests pay 0.1x for those tokens.
-    For a 2000-token system prompt at 100 reviews/day: saves ~90%.
-
-ADAPTIVE THINKING:
-    We enable thinking={"type": "adaptive"} which lets Claude decide
-    when to "think step by step" internally before responding.
-    For code review, this means Claude can reason through complex logic
-    before deciding what comment to post.
-"""
-
 import anthropic
-from typing import Optional
 from config import config
 from agent_tools import TOOLS, execute_tool
 
-# The Anthropic client — this is how we talk to Claude.
-# It reads ANTHROPIC_API_KEY from the environment automatically.
 client = anthropic.Anthropic(api_key=config.anthropic_api_key)
 
-# ================================================================
-# SYSTEM PROMPT
-# ================================================================
-# The system prompt defines Claude's role, capabilities, and behavior.
-# Think of it as the "job description" for the AI agent.
-#
-# GOOD SYSTEM PROMPTS:
-# - Define the agent's role clearly
-# - Set expectations for output quality and format
-# - List the available tools and when to use them
-# - Provide review criteria (what to look for)
-# - Set the tone (constructive, not critical)
-#
-# This is marked for PROMPT CACHING — it never changes per-request,
-# so we pay full price once and then 0.1x for all subsequent requests.
+MAX_ITERATIONS = 20
 
 SYSTEM_PROMPT = """You are an expert senior software engineer performing a thorough GitHub Pull Request review. Your goal is to provide the most helpful, constructive, and technically accurate review possible.
 
@@ -148,201 +77,108 @@ Or add a guard earlier: `user = get_user(user_id) if user_id else None`
 Be constructive and respectful. The goal is to help the author write better code, not to criticize them. Acknowledge good patterns when you see them. Ask questions rather than making assumptions about intent. Suggest improvements rather than just pointing out problems."""
 
 
-# ================================================================
-# THE REVIEW AGENT
-# ================================================================
+def _log_usage(usage) -> None:
+    parts = [f"📊 Tokens: {usage.input_tokens} input, {usage.output_tokens} output"]
+    if cache_read := getattr(usage, "cache_read_input_tokens", 0):
+        parts.append(f"{cache_read} cache_read")
+    if cache_write := getattr(usage, "cache_creation_input_tokens", 0):
+        parts.append(f"{cache_write} cache_write")
+    print(", ".join(parts))
+
+
+def _extract_final_text(content) -> str:
+    for block in content:
+        if hasattr(block, "text"):
+            return block.text
+    return ""
+
+
+def _collect_tool_results(content) -> list:
+    results = []
+    for block in content:
+        if block.type == "text" and block.text.strip():
+            preview = block.text[:200] + ("..." if len(block.text) > 200 else "")
+            print(f"\n💬 Claude: {preview}")
+        elif block.type == "tool_use":
+            print(f"\n🔧 Tool call: {block.name}")
+            for key in ("owner", "repo", "pr_number", "path", "event"):
+                if key in block.input:
+                    print(f"   {key}: {block.input[key]}")
+
+            result = execute_tool(block.name, block.input)
+            preview = result[:200].replace("\n", " ") + ("..." if len(result) > 200 else "")
+            print(f"   Result: {preview}")
+
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result,
+            })
+    return results
+
 
 def review_pr(owner: str, repo: str, pr_number: int) -> dict:
-    """
-    Run the complete PR review agent for a given pull request.
-
-    This is the main entry point. It:
-    1. Sets up the initial messages with the PR to review
-    2. Runs the agentic loop until Claude is done
-    3. Returns a summary of what happened
-
-    Args:
-        owner: GitHub repository owner (username or org)
-        repo: GitHub repository name
-        pr_number: The PR number to review
-
-    Returns:
-        dict with keys:
-        - success: bool
-        - total_tool_calls: int
-        - final_message: str
-        - error: str (only if success=False)
-    """
+    """Run the complete PR review agent for a given pull request."""
     print(f"\n🤖 Starting PR review for {owner}/{repo}#{pr_number}")
     print("=" * 60)
 
-    # ── Step 1: Build initial messages ──────────────────────────
-    # The messages list is the "conversation history" we maintain.
-    # We start with one user message asking for the review.
-    # As Claude calls tools and we return results, we append to this list.
-    messages = [
-        {
-            "role": "user",
-            "content": (
-                f"Please review this pull request:\n\n"
-                f"Repository: {owner}/{repo}\n"
-                f"PR Number: {pr_number}\n\n"
-                f"Provide a thorough code review. Start by getting the PR details "
-                f"and changed files, then post your review with specific line comments "
-                f"for any issues you find."
-            )
-        }
-    ]
+    messages = [{
+        "role": "user",
+        "content": (
+            f"Please review this pull request:\n\n"
+            f"Repository: {owner}/{repo}\n"
+            f"PR Number: {pr_number}\n\n"
+            f"Provide a thorough code review. Start by getting the PR details "
+            f"and changed files, then post your review with specific line comments "
+            f"for any issues you find."
+        ),
+    }]
 
     total_tool_calls = 0
 
-    # ── Step 2: The Agentic Loop ─────────────────────────────────
-    # We keep calling Claude until it signals it's done (end_turn).
-    # Each iteration either:
-    # a) Claude calls a tool → we run it, append result, loop again
-    # b) Claude says "end_turn" → review is complete, we exit
-
-    max_iterations = 20  # Safety limit to prevent infinite loops
-    iteration = 0
-
-    while iteration < max_iterations:
-        iteration += 1
-        print(f"\n⚡ Agent iteration {iteration}/{max_iterations}")
-
-        # ── Call Claude ──────────────────────────────────────────
-        # Key parameters:
-        # - model: claude-opus-4-7 — most capable, best for code review
-        # - max_tokens: 16000 — allows for detailed reviews with many comments
-        # - thinking: adaptive — Claude decides when to reason step by step
-        # - tools: our GitHub tools — what Claude can do
-        # - system + cache_control: the system prompt is cached
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        print(f"\n⚡ Agent iteration {iteration}/{MAX_ITERATIONS}")
 
         response = client.messages.create(
             model=config.model,
             max_tokens=16000,
-            thinking={"type": "adaptive"},  # Claude reasons before acting
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                    # ↑ PROMPT CACHING: This large system prompt is marked as
-                    # cacheable. First call: 1.25x cost to write cache.
-                    # All subsequent calls: 0.1x cost to read from cache.
-                    # With 100 reviews/day on a 2000-token prompt,
-                    # this saves ~$0.18/day at Opus 4.7 pricing.
-                }
-            ],
+            thinking={"type": "adaptive"},
+            system=[{
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
             tools=TOOLS,
             messages=messages,
         )
 
-        # ── Log token usage ──────────────────────────────────────
-        usage = response.usage
-        cache_read = getattr(usage, 'cache_read_input_tokens', 0)
-        cache_write = getattr(usage, 'cache_creation_input_tokens', 0)
-        print(
-            f"📊 Tokens: {usage.input_tokens} input, {usage.output_tokens} output"
-            + (f", {cache_read} cache_read" if cache_read else "")
-            + (f", {cache_write} cache_write" if cache_write else "")
-        )
+        _log_usage(response.usage)
         print(f"🛑 Stop reason: {response.stop_reason}")
 
-        # ── Handle end_turn: Claude is done ──────────────────────
         if response.stop_reason == "end_turn":
-            # Extract the final text message from Claude
-            final_text = ""
-            for block in response.content:
-                if hasattr(block, 'text'):
-                    final_text = block.text
-                    break
-
+            final_text = _extract_final_text(response.content)
             print(f"\n✅ Review complete! Used {total_tool_calls} tool calls.")
             if final_text:
                 print(f"\nClaude's final message:\n{final_text}")
-
             return {
                 "success": True,
                 "total_tool_calls": total_tool_calls,
                 "final_message": final_text,
             }
 
-        # ── Handle tool_use: Claude wants to call a tool ─────────
         if response.stop_reason == "tool_use":
-            # The response content can have multiple blocks:
-            # - ThinkingBlock: Claude's internal reasoning (if thinking is on)
-            # - TextBlock: Claude explaining what it's about to do
-            # - ToolUseBlock: The actual tool call(s)
-
-            # Step 2a: Append Claude's response to message history.
-            # CRITICAL: We must include the FULL response.content, not just text.
-            # The ToolUseBlock must be preserved so Claude knows what it called.
-            messages.append({
-                "role": "assistant",
-                "content": response.content  # Full content including tool_use blocks
-            })
-
-            # Step 2b: Process each tool call in the response.
-            # Claude can request multiple tool calls in one response.
-            tool_results = []
-
-            for block in response.content:
-                # Check if this is a tool use block
-                if block.type != "tool_use":
-                    # Show text blocks (Claude's narration) but skip thinking blocks
-                    if block.type == "text" and block.text.strip():
-                        print(f"\n💬 Claude: {block.text[:200]}{'...' if len(block.text) > 200 else ''}")
-                    continue
-
-                # This is a tool call!
-                tool_name = block.name
-                tool_input = block.input
-                tool_use_id = block.id  # Must echo this back in tool_result
-
-                total_tool_calls += 1
-                print(f"\n🔧 Tool call: {tool_name}")
-
-                # Show the key parameters for logging
-                for key in ["owner", "repo", "pr_number", "path", "event"]:
-                    if key in tool_input:
-                        print(f"   {key}: {tool_input[key]}")
-
-                # Step 2c: Execute the tool and get the result
-                result = execute_tool(tool_name, tool_input)
-
-                # Preview the result for logging
-                result_preview = result[:200].replace('\n', ' ')
-                print(f"   Result: {result_preview}{'...' if len(result) > 200 else ''}")
-
-                # Step 2d: Build the tool_result block.
-                # This is sent back to Claude so it knows what the tool returned.
-                # The tool_use_id must match the id from the tool_use block.
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,  # Links result to the tool call
-                    "content": result,            # The tool's output as a string
-                })
-
-            # Step 2e: Append all tool results as a user message.
-            # All results from this iteration go in ONE user message.
-            # This is the pattern the Anthropic API expects.
-            messages.append({
-                "role": "user",
-                "content": tool_results
-            })
-
-            # Loop back to call Claude again with the tool results in context
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = _collect_tool_results(response.content)
+            total_tool_calls += len(tool_results)
+            messages.append({"role": "user", "content": tool_results})
             continue
 
-        # ── Unexpected stop reason ────────────────────────────────
-        # This shouldn't happen, but be defensive
         print(f"⚠️  Unexpected stop_reason: {response.stop_reason}")
         break
 
-    # If we hit max iterations, something went wrong
     return {
         "success": False,
         "total_tool_calls": total_tool_calls,
         "final_message": "",
-        "error": f"Hit maximum iteration limit ({max_iterations}). Review may be incomplete.",
+        "error": f"Hit maximum iteration limit ({MAX_ITERATIONS}). Review may be incomplete.",
     }
